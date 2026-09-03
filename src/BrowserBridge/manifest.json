@@ -1,0 +1,38 @@
+{
+  "manifest_version": 2,
+  "name": "StreakWatch Browser Bridge",
+  "version": "0.3.0",
+  "description": "Keeps StreakWatch-managed Twitch live tabs open, muted, and deduplicated.",
+  "permissions": [
+    "tabs",
+    "nativeMessaging",
+    "storage",
+    "*://*.twitch.tv/*"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ],
+    "persistent": true
+  },
+  "browser_action": {
+    "default_title": "StreakWatch Bridge",
+    "default_icon": {
+      "16": "icons/streakwatch-16.png",
+      "32": "icons/streakwatch-32.png"
+    }
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "streakwatch-bridge@local"
+    }
+  },
+  "icons": {
+    "16": "icons/streakwatch-16.png",
+    "32": "icons/streakwatch-32.png",
+    "48": "icons/streakwatch-48.png",
+    "64": "icons/streakwatch-64.png",
+    "96": "icons/streakwatch-96.png",
+    "128": "icons/streakwatch-128.png"
+  }
+}

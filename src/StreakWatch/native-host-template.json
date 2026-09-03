@@ -1,0 +1,9 @@
+{
+  "name": "com.streakwatch.bridge",
+  "description": "StreakWatch Firefox native messaging bridge",
+  "path": "__STREAKWATCH_EXE__",
+  "type": "stdio",
+  "allowed_extensions": [
+    "streakwatch-bridge@local"
+  ]
+}
