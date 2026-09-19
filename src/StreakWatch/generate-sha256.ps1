@@ -15,7 +15,8 @@ $files = Get-ChildItem $Path -File -Recurse |
 $outFile = Join-Path $Path "SHA256SUMS.txt"
 $lines = foreach ($file in $files) {
     $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    $relative = [IO.Path]::GetRelativePath((Resolve-Path $Path), $file.FullName)
+    $basePath = (Resolve-Path $Path).Path.TrimEnd([char[]]"\\/")
+    $relative = $file.FullName.Substring($basePath.Length).TrimStart([char[]]"\\/")
     "$hash  $relative"
 }
 

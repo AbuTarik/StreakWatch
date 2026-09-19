@@ -2,16 +2,16 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $appDir = Join-Path $root "src\StreakWatch"
-$project = Join-Path $appDir "StreakWatchV9.3.5.csproj"
+$project = Join-Path $appDir "StreakWatchV10.1.3.csproj"
 $publish = Join-Path $root "dist\publish"
-$package = Join-Path $root "dist\StreakWatch-v9.3.5-win-x64"
-$zip = Join-Path $root "dist\StreakWatch-v9.3.5-win-x64.zip"
+$package = Join-Path $root "dist\StreakWatch-v10.1.3-win-x64"
+$zip = Join-Path $root "dist\StreakWatch-v10.1.3-win-x64.zip"
 
 Remove-Item (Join-Path $root "dist") -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $publish | Out-Null
 New-Item -ItemType Directory -Force -Path $package | Out-Null
 
-Write-Host "Publishing StreakWatch v9.3.5..."
+Write-Host "Publishing StreakWatch v10.1.3..."
 dotnet publish $project -c Release -r win-x64 --self-contained true `
   -p:PublishSingleFile=true `
   -p:IncludeNativeLibrariesForSelfExtract=true `
@@ -85,7 +85,9 @@ $dsc.Save()
 Write-Host "Installed StreakWatch:"
 Write-Host $exe
 Write-Host ""
-Write-Host "Next: install the Mozilla-signed StreakWatch Browser Bridge XPI from the GitHub Release."
+Write-Host "Opening the signed Browser Bridge..."
+$bridgeUrl = "https://github.com/AbuTarik/StreakWatch/releases/latest/download/StreakWatch-Browser-Bridge-1.0.4.xpi"
+try { Start-Process $bridgeUrl } catch { Start-Process "https://github.com/AbuTarik/StreakWatch/releases/latest" }
 Start-Process $exe
 '@ | Set-Content (Join-Path $package "install-prebuilt.ps1") -Encoding UTF8
 
@@ -102,7 +104,7 @@ Write-Host "User settings under %APPDATA%\StreakWatch were kept except NativeMes
 '@ | Set-Content (Join-Path $package "uninstall.ps1") -Encoding UTF8
 
 @'
-StreakWatch v9.3.5 - Windows x64 Test Release
+StreakWatch v10.1.3 - Windows x64 Test Release
 
 INSTALL
 1. Extract this ZIP.

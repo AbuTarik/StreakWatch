@@ -3,10 +3,11 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
-namespace StreakWatchV935;
+namespace StreakWatchV1000;
 
 internal static class Program
 {
@@ -113,6 +114,9 @@ internal static class AppPaths
     public static readonly string DiscordQueuePath =
         Path.Combine(AppDataFolder, "discord-queue.json");
 
+    public static readonly string BotDeviceCredentialPath =
+        Path.Combine(AppDataFolder, "bot-device-token.json");
+
     public static readonly string EventHistoryPath =
         Path.Combine(AppDataFolder, "event-history.log");
 
@@ -131,6 +135,16 @@ internal static class AppPaths
         Directory.CreateDirectory(LogsFolder);
         Directory.CreateDirectory(BackupsFolder);
     }
+}
+
+internal static class ReleaseLinks
+{
+    public const string BrowserBridgeVersion = "1.0.4";
+    public const string BrowserBridgeAssetName = "StreakWatch-Browser-Bridge-1.0.4.xpi";
+    public const string BrowserBridgeInstallUrl =
+        "https://addons.mozilla.org/firefox/addon/streakwatch-browser-bridge/";
+    public const string ReleasesPage =
+        "https://github.com/AbuTarik/StreakWatch/releases/latest";
 }
 
 internal static class JsonOptions
@@ -163,6 +177,138 @@ internal static class SettingsBackup
     }
 }
 
+internal static class PowerAwakeManager
+{
+    [Flags]
+    private enum ExecutionState : uint
+    {
+        SystemRequired = 0x00000001,
+        Continuous = 0x80000000
+    }
+
+    private enum PowerRequestType
+    {
+        DisplayRequired = 0,
+        SystemRequired = 1,
+        AwayModeRequired = 2,
+        ExecutionRequired = 3
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ReasonContext
+    {
+        public uint Version;
+        public uint Flags;
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string SimpleReasonString;
+    }
+
+    private const uint PowerRequestContextVersion = 0;
+    private const uint PowerRequestContextSimpleString = 0x1;
+    private static readonly object Sync = new();
+    private static IntPtr _requestHandle = IntPtr.Zero;
+    private static bool _systemRequestSet;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern ExecutionState SetThreadExecutionState(ExecutionState esFlags);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr PowerCreateRequest(ref ReasonContext context);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PowerSetRequest(IntPtr powerRequest, PowerRequestType requestType);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PowerClearRequest(IntPtr powerRequest, PowerRequestType requestType);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private static bool IsValidHandle(IntPtr handle) => handle != IntPtr.Zero && handle != new IntPtr(-1);
+
+    public static bool SetKeepAwake(bool enabled)
+    {
+        lock (Sync)
+        {
+            try
+            {
+                if (enabled)
+                {
+                    bool requestOk = EnsurePowerRequest();
+                    ExecutionState previous = SetThreadExecutionState(ExecutionState.Continuous | ExecutionState.SystemRequired);
+                    bool executionOk = previous != 0;
+                    bool ok = requestOk || executionOk;
+                    Logger.Log($"POWER | KEEP AWAKE | ON | power-request={(requestOk ? "OK" : "FAILED")} | execution-state={(executionOk ? "OK" : "FAILED")}");
+                    return ok;
+                }
+
+                ReleasePowerRequest();
+                ExecutionState cleared = SetThreadExecutionState(ExecutionState.Continuous);
+                bool clearOk = cleared != 0;
+                Logger.Log($"POWER | KEEP AWAKE | OFF | execution-state-clear={(clearOk ? "OK" : "FAILED")}");
+                return clearOk;
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"POWER | KEEP AWAKE | FAILED | {ex.GetType().Name} | {ex.Message}");
+                return false;
+            }
+        }
+    }
+
+    public static bool Pulse()
+    {
+        try
+        {
+            ExecutionState previous = SetThreadExecutionState(ExecutionState.SystemRequired);
+            bool ok = previous != 0;
+            if (!ok) Logger.Log("POWER | KEEP AWAKE PULSE | FAILED");
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"POWER | KEEP AWAKE PULSE | FAILED | {ex.GetType().Name}");
+            return false;
+        }
+    }
+
+    private static bool EnsurePowerRequest()
+    {
+        if (!IsValidHandle(_requestHandle))
+        {
+            var reason = new ReasonContext
+            {
+                Version = PowerRequestContextVersion,
+                Flags = PowerRequestContextSimpleString,
+                SimpleReasonString = "StreakWatch is monitoring selected Twitch live channels."
+            };
+            _requestHandle = PowerCreateRequest(ref reason);
+            if (!IsValidHandle(_requestHandle))
+            {
+                int error = Marshal.GetLastWin32Error();
+                _requestHandle = IntPtr.Zero;
+                Logger.Log($"POWER | PowerCreateRequest FAILED | win32={error}");
+                return false;
+            }
+        }
+        if (_systemRequestSet) return true;
+        _systemRequestSet = PowerSetRequest(_requestHandle, PowerRequestType.SystemRequired);
+        if (!_systemRequestSet) Logger.Log($"POWER | PowerSetRequest(SystemRequired) FAILED | win32={Marshal.GetLastWin32Error()}");
+        return _systemRequestSet;
+    }
+
+    private static void ReleasePowerRequest()
+    {
+        if (!IsValidHandle(_requestHandle))
+        {
+            _requestHandle = IntPtr.Zero; _systemRequestSet = false; return;
+        }
+        if (_systemRequestSet && !PowerClearRequest(_requestHandle, PowerRequestType.SystemRequired))
+            Logger.Log($"POWER | PowerClearRequest FAILED | win32={Marshal.GetLastWin32Error()}");
+        CloseHandle(_requestHandle);
+        _requestHandle = IntPtr.Zero; _systemRequestSet = false;
+    }
+}
+
 internal sealed class MainForm : Form
 {
     private Settings _settings;
@@ -179,29 +325,34 @@ internal sealed class MainForm : Form
     private readonly ComboBox _browserCombo = new();
     private readonly CheckBox _autoOpenCheck = new();
     private readonly CheckBox _startupCheck = new();
+    private readonly CheckBox _keepAwakeCheck = new();
     private readonly CheckBox _openStartupLiveCheck = new();
     private readonly NumericUpDown _intervalNumeric = new();
     private readonly Label _statusLabel = new();
     private readonly Label _dashboardLabel = new();
     private readonly Label _bridgeStatusLabel = new();
+    private readonly Button _installBridgeButton = new();
     private readonly System.Windows.Forms.Timer _bridgeStatusTimer = new();
     private readonly DiscordNotifier _discordNotifier;
+    private readonly BotAgentClient _botAgentClient;
     private readonly Dictionary<string, string> _previousPlayback =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, HashSet<string>> _recoveryAlertsSent =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Windows.Forms.Timer _recoveryNotifyTimer = new();
     private readonly System.Windows.Forms.Timer _livePlaybackAlertTimer = new();
+    private readonly System.Windows.Forms.Timer _powerKeepAwakeTimer = new();
     private readonly Dictionary<string, ChannelUiStatus> _latestStatuses =
         new(StringComparer.OrdinalIgnoreCase);
     private bool _refreshingGrid;
+    private bool? _lastReportedBridgeConnected;
 
     public MainForm(Settings settings)
     {
         _settings = settings;
         _discordNotifier = new DiscordNotifier(_settings);
 
-        Text = "StreakWatch V9.3.5";
+        Text = "StreakWatch V10.1.3";
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
         Width = 1120;
         Height = 680;
@@ -212,6 +363,15 @@ internal sealed class MainForm : Form
         LoadSettingsIntoUi();
 
         _watcher = new TwitchWatcher(_settings);
+        _botAgentClient = new BotAgentClient(
+            _settings,
+            () => BuildBotHeartbeat(),
+            async snapshot => await _watcher.ApplyRemoteLiveSnapshotAsync(snapshot));
+
+        SystemEvents.SessionSwitch += OnSessionSwitch;
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
+        ApplyKeepAwakePolicy();
+
         _watcher.StatusChanged += Watcher_StatusChanged;
         _watcher.GeneralStatusChanged += message =>
         {
@@ -224,14 +384,8 @@ internal sealed class MainForm : Form
         trayMenu.Items.Add("Check now", null, async (_, _) => await _watcher.CheckAllAsync(true));
         trayMenu.Items.Add("Open log", null, (_, _) => OpenFile(AppPaths.LogPath));
         trayMenu.Items.Add("Open settings folder", null, (_, _) => OpenFolder(AppPaths.AppDataFolder));
-        trayMenu.Items.Add("Firefox extension setup", null, (_, _) =>
-        {
-            string setup = Path.Combine(AppContext.BaseDirectory, "FirefoxExtension", "INSTALL.txt");
-            if (File.Exists(setup))
-                OpenFile(setup);
-            else
-                MessageBox.Show("FirefoxExtension\\INSTALL.txt was not found next to StreakWatch.");
-        });
+        trayMenu.Items.Add("Install Firefox Browser Bridge", null, (_, _) =>
+            OpenBrowserBridgeInstall());
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add("Exit", null, async (_, _) => await ExitApplicationAsync("Exit selected from system tray"));
 
@@ -260,6 +414,7 @@ internal sealed class MainForm : Form
         _watcher.LiveStarted += (channel, streamId) =>
         {
             EventHistory.Add("LIVE", channel, $"stream={streamId ?? "unknown"}");
+            _ = _botAgentClient.SendEventAsync("local_live", channel, $"stream={streamId ?? "unknown"}");
             if (_settings.DiscordEnabled)
                 _ = _discordNotifier.NotifyEventAsync(
                     DiscordEventKeys.Live,
@@ -270,6 +425,10 @@ internal sealed class MainForm : Form
         _watcher.NetworkChanged += restored =>
         {
             EventHistory.Add("NETWORK", "", restored ? "RESTORED" : "LOST");
+            _ = _botAgentClient.SendEventAsync(
+                restored ? "network_restored" : "network_lost",
+                "",
+                restored ? "Local PC network/Twitch connectivity restored." : "Local PC network/Twitch connectivity lost.");
             if (!_settings.DiscordEnabled) return;
             if (restored && _settings.DiscordNotifyNetworkRestored)
                 _ = _discordNotifier.NotifyEventAsync(
@@ -285,6 +444,7 @@ internal sealed class MainForm : Form
 
         _watcher.PlaybackProblem += message =>
         {
+            _ = _botAgentClient.SendEventAsync("playback_problem", "", message);
             if (_settings.DiscordEnabled)
                 _ = _discordNotifier.NotifyEventAsync(
                     DiscordEventKeys.PlaybackProblem,
@@ -295,6 +455,7 @@ internal sealed class MainForm : Form
         _watcher.StreamOffline += channel =>
         {
             EventHistory.Add("OFFLINE", channel, "grace-confirmed");
+            _ = _botAgentClient.SendEventAsync("local_offline", channel, "grace-confirmed");
             if (_settings.DiscordEnabled)
                 _ = _discordNotifier.NotifyEventAsync(
                     DiscordEventKeys.Offline,
@@ -306,6 +467,14 @@ internal sealed class MainForm : Form
         _recoveryNotifyTimer.Tick += (_, _) => CheckRecoveryImportanceNotifications();
         _recoveryNotifyTimer.Start();
         _livePlaybackAlertTimer.Interval=10000; _livePlaybackAlertTimer.Tick += (_,_) => CheckLiveNotPlayingAlerts(); _livePlaybackAlertTimer.Start();
+
+        _powerKeepAwakeTimer.Interval = 30_000;
+        _powerKeepAwakeTimer.Tick += (_, _) =>
+        {
+            if (_settings.KeepAwakeWhileMonitoring && !_watcher.IsPaused)
+                PowerAwakeManager.Pulse();
+        };
+        _powerKeepAwakeTimer.Start();
 
         _bridgeStatusTimer.Interval = 2000;
         _bridgeStatusTimer.Tick += (_, _) => RefreshBridgeStatus();
@@ -367,6 +536,19 @@ internal sealed class MainForm : Form
             : null;
         bool connected = firefoxRunning && ageSeconds.HasValue && ageSeconds.Value <= 10;
 
+        if (_lastReportedBridgeConnected != connected)
+        {
+            bool hadPrevious = _lastReportedBridgeConnected.HasValue;
+            _lastReportedBridgeConnected = connected;
+            if (hadPrevious)
+                _ = _botAgentClient.SendEventAsync(
+                    connected ? "bridge_online" : "bridge_offline",
+                    "",
+                    connected
+                        ? $"Firefox Bridge connected. Extension {extensionVersion}."
+                        : "Firefox Bridge is no longer connected.");
+        }
+
         string heartbeatText = ageSeconds.HasValue
             ? $"{Math.Round(ageSeconds.Value):0}s ago"
             : "never";
@@ -374,6 +556,35 @@ internal sealed class MainForm : Form
             $"Firefox: {(firefoxRunning ? "Running" : "Not running")} | " +
             $"Bridge: {(connected ? "Connected ✓" : "Disconnected ⚠")} | " +
             $"Extension: {extensionVersion} | Heartbeat: {heartbeatText}";
+
+        _installBridgeButton.Visible = !connected;
+        _installBridgeButton.Text = connected
+            ? "Browser Bridge installed"
+            : $"Install Bridge {ReleaseLinks.BrowserBridgeVersion}";
+    }
+
+    private static void OpenBrowserBridgeInstall()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = ReleaseLinks.BrowserBridgeInstallUrl,
+                UseShellExecute = true
+            });
+        }
+        catch
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = ReleaseLinks.ReleasesPage,
+                    UseShellExecute = true
+                });
+            }
+            catch { }
+        }
     }
 
     private async Task RunStartupHealthCheckAsync()
@@ -392,7 +603,7 @@ internal sealed class MainForm : Form
             catch { }
 
             string report =
-                $"StreakWatch V9.3.5 startup health{Environment.NewLine}" +
+                $"StreakWatch V10.1.3 startup health{Environment.NewLine}" +
                 $"Time: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}{Environment.NewLine}" +
                 $"Firefox: {(firefox ? "OK" : "NOT RUNNING")}{Environment.NewLine}" +
                 $"Bridge: {(bridge ? "CONNECTED" : "DISCONNECTED")}{Environment.NewLine}" +
@@ -582,6 +793,11 @@ internal sealed class MainForm : Form
         _startupCheck.Left = 510;
         _startupCheck.Top = 12;
 
+        _keepAwakeCheck.Text = "Keep PC awake while monitoring";
+        _keepAwakeCheck.AutoSize = true;
+        _keepAwakeCheck.Left = 665;
+        _keepAwakeCheck.Top = 12;
+
         _openStartupLiveCheck.Text = "Open channels already LIVE when StreakWatch starts";
         _openStartupLiveCheck.AutoSize = true;
         _openStartupLiveCheck.Left = 10;
@@ -630,6 +846,14 @@ internal sealed class MainForm : Form
         _bridgeStatusLabel.Left = 410;
         _bridgeStatusLabel.Top = 82;
 
+        _installBridgeButton.Text = "Install Browser Bridge";
+        _installBridgeButton.Width = 150;
+        _installBridgeButton.Height = 27;
+        _installBridgeButton.Left = 820;
+        _installBridgeButton.Top = 75;
+        _installBridgeButton.Visible = false;
+        _installBridgeButton.Click += (_, _) => OpenBrowserBridgeInstall();
+
         var exportButton = new Button
         {
             Text = "Export settings",
@@ -653,6 +877,15 @@ internal sealed class MainForm : Form
             Height = 30
         };
         discordButton.Click += (_, _) => OpenDiscordSettings();
+
+        var botAgentButton = new Button
+        {
+            Text = "24/7 Bot",
+            Width = 95,
+            Height = 30
+        };
+        botAgentButton.Click += (_, _) => OpenBotAgentSettings();
+
 
         var logsButton = new Button
         {
@@ -697,7 +930,7 @@ internal sealed class MainForm : Form
             Margin = Padding.Empty
         };
         actionsFlow.Controls.AddRange([
-            discordButton, exportButton, importButton, logsButton,
+            discordButton, botAgentButton, exportButton, importButton, logsButton,
             historyButton, diagnosticsButton, advancedButton
         ]);
 
@@ -731,9 +964,10 @@ internal sealed class MainForm : Form
         linksFlow.Controls.AddRange([openLog, openFolder]);
 
         settingsPanel.Controls.AddRange([
-            browserLabel, _browserCombo, _autoOpenCheck, _startupCheck,
+            browserLabel, _browserCombo, _autoOpenCheck, _startupCheck, _keepAwakeCheck,
             _openStartupLiveCheck, intervalLabel, _intervalNumeric, secondsLabel,
-            _saveButton, _statusLabel, _dashboardLabel, _bridgeStatusLabel
+            _saveButton, _statusLabel, _dashboardLabel, _bridgeStatusLabel,
+            _installBridgeButton
         ]);
 
         settingsPanel.Controls.Add(actionsFlow);
@@ -753,6 +987,7 @@ internal sealed class MainForm : Form
 
         _autoOpenCheck.Checked = _settings.OpenStreamAutomatically;
         _startupCheck.Checked = _settings.StartWithWindows;
+        _keepAwakeCheck.Checked = _settings.KeepAwakeWhileMonitoring;
         _openStartupLiveCheck.Checked = _settings.OpenAlreadyLiveOnStartup;
         _intervalNumeric.Value = Math.Clamp(_settings.CheckEverySeconds, 10, 3600);
 
@@ -889,6 +1124,7 @@ internal sealed class MainForm : Form
 
         _settings.OpenStreamAutomatically = _autoOpenCheck.Checked;
         _settings.StartWithWindows = _startupCheck.Checked;
+        _settings.KeepAwakeWhileMonitoring = _keepAwakeCheck.Checked;
         _settings.OpenAlreadyLiveOnStartup = _openStartupLiveCheck.Checked;
         _settings.CheckEverySeconds = (int)_intervalNumeric.Value;
 
@@ -913,6 +1149,8 @@ internal sealed class MainForm : Form
 
         _watcher.ApplySettings(_settings);
         _discordNotifier.ApplySettings(_settings);
+        _botAgentClient.ApplySettings(_settings);
+        ApplyKeepAwakePolicy();
         RefreshGridFromSettings();
     }
 
@@ -981,10 +1219,75 @@ internal sealed class MainForm : Form
         }
     }
 
+    private void ApplyKeepAwakePolicy()
+    {
+        bool enabled =
+            _settings.KeepAwakeWhileMonitoring &&
+            !_watcher.IsPaused;
+
+        PowerAwakeManager.SetKeepAwake(enabled);
+    }
+
+    private void OnSessionSwitch(object? sender, SessionSwitchEventArgs e)
+    {
+        string state = e.Reason switch
+        {
+            SessionSwitchReason.SessionLock => "LOCKED",
+            SessionSwitchReason.SessionUnlock => "UNLOCKED",
+            SessionSwitchReason.ConsoleConnect => "CONSOLE-CONNECT",
+            SessionSwitchReason.ConsoleDisconnect => "CONSOLE-DISCONNECT",
+            _ => e.Reason.ToString().ToUpperInvariant()
+        };
+
+        Logger.Log($"WINDOWS SESSION | {state}");
+        EventHistory.Add("WINDOWS-SESSION", "", state);
+
+        if (e.Reason == SessionSwitchReason.SessionLock)
+        {
+            // Locking Windows must not allow automatic sleep to stop monitoring.
+            ApplyKeepAwakePolicy();
+        }
+        else if (e.Reason == SessionSwitchReason.SessionUnlock)
+        {
+            ApplyKeepAwakePolicy();
+            _ = _watcher.CheckAllAsync(true);
+        }
+    }
+
+    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        Logger.Log($"WINDOWS POWER | {e.Mode}");
+        EventHistory.Add("WINDOWS-POWER", "", e.Mode.ToString().ToUpperInvariant());
+
+        if (e.Mode == PowerModes.Suspend &&
+            _settings.KeepAwakeWhileMonitoring &&
+            !_watcher.IsPaused)
+        {
+            Logger.Log("WINDOWS POWER | SUSPEND occurred while Keep Awake was ON | possible user/lid action or Windows power-policy override");
+            EventHistory.Add("POWER-WARNING", "", "Suspend occurred while Keep Awake was ON (user/lid action or power-policy override may bypass app requests)");
+        }
+
+        if (e.Mode == PowerModes.Resume)
+        {
+            ApplyKeepAwakePolicy();
+            PowerAwakeManager.Pulse();
+
+            var timer = new System.Windows.Forms.Timer { Interval = 1500 };
+            timer.Tick += async (_, _) =>
+            {
+                timer.Stop();
+                timer.Dispose();
+                await _watcher.CheckAllAsync(true);
+            };
+            timer.Start();
+        }
+    }
+
     private void ToggleMonitoringPause()
     {
         bool paused = !_watcher.IsPaused;
         _watcher.SetPaused(paused);
+        ApplyKeepAwakePolicy();
         _pauseButton.Text = paused ? "Resume monitoring" : "Pause monitoring";
         _statusLabel.Text = paused
             ? "Monitoring PAUSED - existing Firefox tabs are left untouched"
@@ -1304,27 +1607,252 @@ internal sealed class MainForm : Form
 
     private async Task RunDiagnosticsAsync(bool showMessage = true)
     {
-        var lines=new List<string>{"StreakWatch V9.3.5 Diagnostics",$"Time: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}",$"Firefox bridge state: {File.Exists(AppPaths.BrowserBridgePath)}",$"Native heartbeat: {File.Exists(AppPaths.NativeHeartbeatPath)}",$"Browser status: {File.Exists(AppPaths.BrowserStatusPath)}",$"Startup health report: {File.Exists(AppPaths.StartupHealthPath)}",$"Remote snapshot: {File.Exists(AppPaths.RemoteSnapshotPath)}",$"Discord rooms: {DiscordSecretStore.LoadWebhooks().Count}",$"Channels: {_settings.Channels.Count}",$"Safe Mode: {_settings.SafeMode}"};
+        var lines=new List<string>{"StreakWatch V10.1.3 Diagnostics",$"Time: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}",$"Firefox bridge state: {File.Exists(AppPaths.BrowserBridgePath)}",$"Native heartbeat: {File.Exists(AppPaths.NativeHeartbeatPath)}",$"Browser status: {File.Exists(AppPaths.BrowserStatusPath)}",$"Startup health report: {File.Exists(AppPaths.StartupHealthPath)}",$"Remote snapshot: {File.Exists(AppPaths.RemoteSnapshotPath)}",$"Remote Sentinel pack: Cloudflare Worker included in release builder",$"Discord rooms: {DiscordSecretStore.LoadWebhooks().Count}",$"Channels: {_settings.Channels.Count}",$"Safe Mode: {_settings.SafeMode}"};
         try { await _watcher.CheckAllAsync(true); lines.Add("Twitch check: OK"); } catch(Exception ex) { lines.Add("Twitch check: "+ex.Message); }
         foreach(var s in _latestStatuses.Values.OrderBy(x=>x.Channel)) lines.Add($"{s.Channel}: {s.Status} | {s.PlaybackStatus} | {s.DetectionConfidence}");
         string report=string.Join(Environment.NewLine,lines); File.WriteAllText(AppPaths.DiagnosticsPath,report); if(showMessage) MessageBox.Show(report,"Diagnostics");
     }
+    private BotAgentHeartbeat BuildBotHeartbeat()
+    {
+        bool firefoxRunning = false;
+        try { firefoxRunning = Process.GetProcessesByName("firefox").Length > 0; } catch { }
+
+        bool bridgeConnected = false;
+        string extensionVersion = "unknown";
+        try
+        {
+            if (File.Exists(AppPaths.NativeHeartbeatPath))
+            {
+                using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(AppPaths.NativeHeartbeatPath));
+                JsonElement root = doc.RootElement;
+                DateTime? updated = null;
+                if (root.TryGetProperty("updatedUtc", out JsonElement u) &&
+                    u.ValueKind == JsonValueKind.String &&
+                    DateTime.TryParse(u.GetString(), out DateTime p))
+                    updated = p.ToUniversalTime();
+                if (root.TryGetProperty("extensionVersion", out JsonElement v) &&
+                    v.ValueKind == JsonValueKind.String)
+                    extensionVersion = v.GetString() ?? "unknown";
+                bridgeConnected =
+                    firefoxRunning &&
+                    updated.HasValue &&
+                    (DateTime.UtcNow - updated.Value).TotalSeconds <= 10;
+            }
+        }
+        catch { }
+
+        return new BotAgentHeartbeat
+        {
+            Name = string.IsNullOrWhiteSpace(_settings.BotAgentName)
+                ? Environment.MachineName
+                : _settings.BotAgentName.Trim(),
+            AppVersion = "10.1.3",
+            Bridge = bridgeConnected ? $"connected/{extensionVersion}" : "disconnected",
+            NetworkHealthy = NetworkInterface.GetIsNetworkAvailable(),
+            MonitoringPaused = _watcher.IsPaused
+        };
+    }
+
+    private void OpenBotAgentSettings()
+    {
+        using var f = new Form
+        {
+            Text = "24/7 Discord Bot connection",
+            Width = 720,
+            Height = 500,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false
+        };
+
+        var enabled = new CheckBox
+        {
+            Text = "Connect this PC to the hosted StreakWatch Discord Bot",
+            Left = 20, Top = 20, Width = 640,
+            Checked = _settings.BotControlEnabled
+        };
+        var urlLabel = new Label { Text = "Bot public API base URL", Left = 20, Top = 60, Width = 250 };
+        var url = new TextBox { Left = 20, Top = 82, Width = 660, Text = _settings.BotApiBaseUrl };
+        var nameLabel = new Label { Text = "PC / Device name", Left = 20, Top = 120, Width = 200 };
+        var name = new TextBox { Left = 20, Top = 142, Width = 320, Text = _settings.BotAgentName };
+
+        BotDeviceCredential? existing = BotDeviceCredentialStore.Load();
+        var pairedLabel = new Label
+        {
+            Left = 365, Top = 122, Width = 315, Height = 58,
+            Text = existing is null
+                ? "Status: Not paired"
+                : $"Status: Paired ✓\nServer: {existing.GuildName}\nDevice ID: {existing.DeviceId}"
+        };
+
+        var codeLabel = new Label { Text = "One-time pairing code from Discord (/pair create)", Left = 20, Top = 195, Width = 400 };
+        var code = new TextBox
+        {
+            Left = 20, Top = 217, Width = 240,
+            CharacterCasing = CharacterCasing.Upper,
+            PlaceholderText = "ABCD-EFGH"
+        };
+        var pair = new Button { Text = existing is null ? "Pair Device" : "Pair Again", Left = 275, Top = 215, Width = 125 };
+        var test = new Button { Text = "Test connection", Left = 410, Top = 215, Width = 130 };
+        var unpair = new Button { Text = "Unpair", Left = 550, Top = 215, Width = 130, Enabled = existing is not null };
+
+        var hint = new Label
+        {
+            Left = 20, Top = 265, Width = 660, Height = 80,
+            Text = "Setup: add the official StreakWatch bot to your Discord server, run /pair create, then paste the one-time code here. The Discord bot token is NEVER entered into StreakWatch. Each PC receives its own revocable device token."
+        };
+        var security = new Label
+        {
+            Left = 20, Top = 345, Width = 660, Height = 42,
+            Text = "The pairing code expires and can be used once. The resulting device token is stored separately from settings exports."
+        };
+
+        var save = new Button { Text = "Save", Left = 520, Top = 405, Width = 75 };
+        var cancel = new Button { Text = "Cancel", Left = 605, Top = 405, Width = 75, DialogResult = DialogResult.Cancel };
+
+        async Task SaveUiToClientAsync(bool forceEnable)
+        {
+            _settings.BotApiBaseUrl = url.Text.Trim().TrimEnd('/');
+            _settings.BotAgentName = string.IsNullOrWhiteSpace(name.Text) ? Environment.MachineName : name.Text.Trim();
+            if (forceEnable) _settings.BotControlEnabled = true;
+            _botAgentClient.ApplySettings(_settings);
+            await Task.CompletedTask;
+        }
+
+        pair.Click += async (_, _) =>
+        {
+            if (string.IsNullOrWhiteSpace(url.Text))
+            {
+                MessageBox.Show("Enter the hosted bot API base URL first.");
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(code.Text))
+            {
+                MessageBox.Show("Run /pair create in Discord, then enter the one-time pairing code.");
+                return;
+            }
+
+            pair.Enabled = false;
+            try
+            {
+                await SaveUiToClientAsync(true);
+                BotPairResult result = await _botAgentClient.PairAsync(code.Text.Trim(), _settings.BotAgentName);
+                if (!result.Ok)
+                {
+                    MessageBox.Show($"Pairing failed: {result.Error ?? "unknown error"}", "StreakWatch");
+                    return;
+                }
+
+                code.Clear();
+                existing = BotDeviceCredentialStore.Load();
+                pairedLabel.Text = existing is null
+                    ? "Status: Not paired"
+                    : $"Status: Paired ✓\nServer: {existing.GuildName}\nDevice ID: {existing.DeviceId}";
+                pair.Text = "Pair Again";
+                unpair.Enabled = existing is not null;
+                bool heartbeatOk = await _botAgentClient.SendHeartbeatNowAsync();
+                MessageBox.Show(
+                    heartbeatOk
+                        ? $"Paired successfully with {existing?.GuildName ?? "Discord server"}."
+                        : "Pairing succeeded, but the first heartbeat failed. Check hosting/network and try Test connection.",
+                    "StreakWatch");
+            }
+            finally { pair.Enabled = true; }
+        };
+
+        test.Click += async (_, _) =>
+        {
+            if (string.IsNullOrWhiteSpace(url.Text))
+            {
+                MessageBox.Show("Enter the hosted bot API base URL first.");
+                return;
+            }
+            await SaveUiToClientAsync(true);
+            if (BotDeviceCredentialStore.Load() is null)
+            {
+                MessageBox.Show("This PC is not paired yet. Run /pair create in Discord and pair this device first.");
+                return;
+            }
+            bool ok = await _botAgentClient.SendHeartbeatNowAsync();
+            MessageBox.Show(ok ? "Connected to the 24/7 bot API." : "Connection failed. Check the API URL, hosting status, pairing, and logs.");
+        };
+
+        unpair.Click += async (_, _) =>
+        {
+            if (BotDeviceCredentialStore.Load() is null) return;
+            if (MessageBox.Show("Revoke this PC's pairing token? You will need a new /pair create code to reconnect.", "StreakWatch", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                return;
+            await SaveUiToClientAsync(true);
+            bool remoteOk = await _botAgentClient.UnpairAsync();
+            BotDeviceCredentialStore.Clear();
+            existing = null;
+            pairedLabel.Text = "Status: Not paired";
+            pair.Text = "Pair Device";
+            unpair.Enabled = false;
+            MessageBox.Show(remoteOk ? "Device unpaired." : "Local pairing removed. The server could not be reached to revoke it remotely.");
+        };
+
+        save.Click += (_, _) =>
+        {
+            if (enabled.Checked && string.IsNullOrWhiteSpace(url.Text))
+            {
+                MessageBox.Show("Enter the hosted bot API base URL.");
+                return;
+            }
+            if (enabled.Checked && BotDeviceCredentialStore.Load() is null)
+            {
+                MessageBox.Show("Pair this PC first using a one-time Discord pairing code.");
+                return;
+            }
+
+            _settings.BotControlEnabled = enabled.Checked;
+            _settings.BotApiBaseUrl = url.Text.Trim().TrimEnd('/');
+            _settings.BotAgentName = string.IsNullOrWhiteSpace(name.Text) ? Environment.MachineName : name.Text.Trim();
+            SaveSettingsAndApply();
+            f.DialogResult = DialogResult.OK;
+            f.Close();
+        };
+
+        f.Controls.AddRange([enabled,urlLabel,url,nameLabel,name,pairedLabel,codeLabel,code,pair,test,unpair,hint,security,save,cancel]);
+        f.AcceptButton = save;
+        f.CancelButton = cancel;
+        f.ShowDialog(this);
+    }
+
+
     private void OpenAdvancedSettings()
     {
-        using var f=new Form { Text="Advanced / Safety / Updates", Width=640, Height=590, StartPosition=FormStartPosition.CenterParent };
-        var safe=new CheckBox { Text="Safe Mode (block suspicious mass-LIVE opening)", Left=20, Top=20, Width=520, Checked=_settings.SafeMode };
-        var n=new NumericUpDown { Left=270, Top=55, Width=80, Minimum=2, Maximum=20, Value=Math.Clamp(_settings.SafeModeBurstThreshold,2,20) }; var nl=new Label { Text="Burst threshold:",Left=20,Top=59,Width=220 };
-        var alert=new CheckBox { Text="Emergency alert if LIVE but playback does not start",Left=20,Top=95,Width=520,Checked=_settings.LiveNotPlayingAlert };
-        var secs=new NumericUpDown { Left=270,Top=130,Width=80,Minimum=20,Maximum=600,Value=Math.Clamp(_settings.LiveNotPlayingSeconds,20,600) }; var sl=new Label { Text="Emergency alert after seconds:",Left=20,Top=134,Width=240 };
-        var safety=new NumericUpDown { Left=270,Top=170,Width=80,Minimum=30,Maximum=1800,Value=Math.Clamp(_settings.PlaybackSafetyTargetSeconds,30,1800) }; var safel=new Label { Text="Playback safety target (seconds):",Left=20,Top=174,Width=240 };
-        var smart=new NumericUpDown { Left=270,Top=210,Width=80,Minimum=3,Maximum=15,Value=Math.Clamp(_settings.SmartLiveRecheckSeconds,3,15) }; var smartl=new Label { Text="Smart LIVE/problem recheck (seconds):",Left=20,Top=214,Width=245 };
-        var heal=new NumericUpDown { Left=270,Top=250,Width=80,Minimum=10,Maximum=120,Value=Math.Clamp(_settings.BridgeSelfHealSeconds,10,120) }; var heall=new Label { Text="Bridge self-heal after (seconds):",Left=20,Top=254,Width=240 };
-        var remote=new CheckBox { Text="Write remote-monitor snapshot (VPS detection handoff foundation)",Left=20,Top=290,Width=550,Checked=_settings.RemoteMonitorSnapshotEnabled };
-        var upd=new CheckBox { Text="Enable update checker",Left=20,Top=330,Width=300,Checked=_settings.UpdateCheckEnabled };
-        var url=new TextBox { Left=20,Top=365,Width=580,Text=_settings.UpdateManifestUrl??"",PlaceholderText="Update manifest URL (GitHub raw later)" };
-        var backup=new Button { Text="Backup settings now",Left=20,Top=410,Width=160 }; backup.Click += (_,_)=>{SettingsBackup.Create();MessageBox.Show("Backup created.");};
-        var save=new Button { Text="Save",Left=390,Top=485,Width=90 }; var cancel=new Button { Text="Cancel",Left=500,Top=485,Width=90,DialogResult=DialogResult.Cancel };
+        using var f=new Form { Text="Advanced / Low Data / Safety", Width=690, Height=760, StartPosition=FormStartPosition.CenterParent };
+        var low=new CheckBox { Text="Low Data Mode (recommended for limited/slow internet)",Left=20,Top=18,Width=600,Checked=_settings.LowDataMode };
+        var max=new NumericUpDown { Left=300,Top=53,Width=80,Minimum=1,Maximum=4,Value=Math.Clamp(_settings.MaxSimultaneousStreams,1,4) };
+        var maxl=new Label { Text="Maximum simultaneous Twitch streams:",Left=20,Top=57,Width=270 };
+        var target=new NumericUpDown { Left=300,Top=88,Width=80,Minimum=300,Maximum=3600,Increment=60,Value=Math.Clamp(_settings.LowDataTargetSeconds,300,3600) };
+        var targetl=new Label { Text="Low-data watch target (seconds):",Left=20,Top=92,Width=270 };
+        var closeTarget=new CheckBox { Text="Close managed tab after low-data target, then continue with next LIVE channel",Left=20,Top=123,Width=640,Checked=_settings.CloseAfterLowDataTarget };
+        var monitorOnly=new CheckBox { Text="Monitor only — detect/notify LIVE, never open Twitch automatically",Left=20,Top=153,Width=620,Checked=_settings.MonitorOnly };
+        var note=new Label { Text="Note: the target limits data use; StreakWatch cannot guarantee Twitch will award a streak.",Left=20,Top=181,Width=640,Height=35 };
+
+        var safe=new CheckBox { Text="Safe Mode (block suspicious untrusted mass-LIVE opening)", Left=20, Top=220, Width=600, Checked=_settings.SafeMode };
+        var n=new NumericUpDown { Left=300, Top=255, Width=80, Minimum=2, Maximum=20, Value=Math.Clamp(_settings.SafeModeBurstThreshold,2,20) }; var nl=new Label { Text="Burst threshold:",Left=20,Top=259,Width=270 };
+        var alert=new CheckBox { Text="Emergency alert if LIVE but playback does not start",Left=20,Top=290,Width=600,Checked=_settings.LiveNotPlayingAlert };
+        var secs=new NumericUpDown { Left=300,Top=325,Width=80,Minimum=20,Maximum=600,Value=Math.Clamp(_settings.LiveNotPlayingSeconds,20,600) }; var sl=new Label { Text="Emergency alert after seconds:",Left=20,Top=329,Width=270 };
+        var safety=new NumericUpDown { Left=300,Top=360,Width=80,Minimum=30,Maximum=1800,Value=Math.Clamp(_settings.PlaybackSafetyTargetSeconds,30,1800) }; var safel=new Label { Text="Internal playback safety marker (seconds):",Left=20,Top=364,Width=280 };
+        var smart=new NumericUpDown { Left=300,Top=395,Width=80,Minimum=3,Maximum=15,Value=Math.Clamp(_settings.SmartLiveRecheckSeconds,3,15) }; var smartl=new Label { Text="Smart LIVE/problem recheck (seconds):",Left=20,Top=399,Width=280 };
+        var heal=new NumericUpDown { Left=300,Top=430,Width=80,Minimum=10,Maximum=120,Value=Math.Clamp(_settings.BridgeSelfHealSeconds,10,120) }; var heall=new Label { Text="Bridge self-heal after (seconds):",Left=20,Top=434,Width=270 };
+        var quality=new CheckBox { Text="Use lowest Twitch quality on each page load",Left=20,Top=470,Width=600,Checked=_settings.ForceLowestStreamQuality };
+        var remote=new CheckBox { Text="Write remote-monitor snapshot (future always-on monitor handoff)",Left=20,Top=505,Width=600,Checked=_settings.RemoteMonitorSnapshotEnabled };
+        var upd=new CheckBox { Text="Enable update checker",Left=20,Top=540,Width=300,Checked=_settings.UpdateCheckEnabled };
+        var url=new TextBox { Left=20,Top=575,Width=630,Text=_settings.UpdateManifestUrl??"",PlaceholderText="Update manifest URL" };
+        var backup=new Button { Text="Backup settings now",Left=20,Top=620,Width=170 }; backup.Click += (_,_)=>{SettingsBackup.Create();MessageBox.Show("Backup created.");};
+        var save=new Button { Text="Save",Left=440,Top=665,Width=90 }; var cancel=new Button { Text="Cancel",Left=550,Top=665,Width=90,DialogResult=DialogResult.Cancel };
+
         save.Click += (_,_)=>{
+            _settings.LowDataMode=low.Checked;
+            _settings.MaxSimultaneousStreams=(int)max.Value;
+            _settings.CloseAfterLowDataTarget=closeTarget.Checked;
+            _settings.LowDataTargetSeconds=(int)target.Value;
+            _settings.MonitorOnly=monitorOnly.Checked;
             _settings.SafeMode=safe.Checked;
             _settings.SafeModeBurstThreshold=(int)n.Value;
             _settings.LiveNotPlayingAlert=alert.Checked;
@@ -1332,12 +1860,13 @@ internal sealed class MainForm : Form
             _settings.PlaybackSafetyTargetSeconds=(int)safety.Value;
             _settings.SmartLiveRecheckSeconds=(int)smart.Value;
             _settings.BridgeSelfHealSeconds=(int)heal.Value;
+            _settings.ForceLowestStreamQuality=quality.Checked;
             _settings.RemoteMonitorSnapshotEnabled=remote.Checked;
             _settings.UpdateCheckEnabled=upd.Checked;
             _settings.UpdateManifestUrl=url.Text.Trim();
             SaveSettingsAndApply(); f.Close();
         };
-        f.Controls.AddRange([safe,n,nl,alert,secs,sl,safety,safel,smart,smartl,heal,heall,remote,upd,url,backup,save,cancel]);
+        f.Controls.AddRange([low,max,maxl,target,targetl,closeTarget,monitorOnly,note,safe,n,nl,alert,secs,sl,safety,safel,smart,smartl,heal,heall,quality,remote,upd,url,backup,save,cancel]);
         f.ShowDialog(this);
     }
     private void CheckLiveNotPlayingAlerts()
@@ -1795,8 +2324,13 @@ internal sealed class MainForm : Form
 
             _recoveryNotifyTimer.Stop();
             _livePlaybackAlertTimer.Stop();
+            _powerKeepAwakeTimer.Stop();
             _bridgeStatusTimer.Stop();
+            SystemEvents.SessionSwitch -= OnSessionSwitch;
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            PowerAwakeManager.SetKeepAwake(false);
             _watcher.Dispose();
+            _botAgentClient.Dispose();
             _discordNotifier.Dispose();
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
@@ -1852,9 +2386,15 @@ internal sealed class MainForm : Form
         _recoveryNotifyTimer.Dispose();
         _livePlaybackAlertTimer.Stop();
         _livePlaybackAlertTimer.Dispose();
+        _powerKeepAwakeTimer.Stop();
+        _powerKeepAwakeTimer.Dispose();
         _bridgeStatusTimer.Stop();
         _bridgeStatusTimer.Dispose();
+        SystemEvents.SessionSwitch -= OnSessionSwitch;
+        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        PowerAwakeManager.SetKeepAwake(false);
         _watcher.Dispose();
+        _botAgentClient.Dispose();
         _discordNotifier.Dispose();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
@@ -1914,6 +2454,8 @@ internal sealed class TwitchWatcher : IDisposable
     private int _checking;
     private bool? _networkHealthy;
     private int _networkRecoveryGeneration;
+    private readonly object _networkStateLock = new();
+    private readonly string _bridgeSessionId = Guid.NewGuid().ToString("N");
     private bool _firstRun = true;
     private bool _paused;
     public bool IsPaused => _paused;
@@ -1970,7 +2512,7 @@ internal sealed class TwitchWatcher : IDisposable
         _browserWatchdogTimer.Start();
         _browserStatusTimer.Start();
 
-        Logger.Log($"STARTED | V9.3.5 | channels={_channels.Count}");
+        Logger.Log($"STARTED | V10.1.3 | channels={_channels.Count}");
     }
 
     public void SetPaused(bool paused)
@@ -2209,6 +2751,7 @@ internal sealed class TwitchWatcher : IDisposable
                 runtime.LiveDetectedUtc ??= DateTime.UtcNow;
                 runtime.LiveNotPlayingAlertSent = false;
                 runtime.PlaybackConfirmedSinceUtc = null;
+                runtime.PlaybackProblemSinceUtc = null;
                 runtime.SafetyTargetReached = false;
 
                 Logger.Log(
@@ -2271,6 +2814,7 @@ internal sealed class TwitchWatcher : IDisposable
                 runtime.LiveDetectedUtc = DateTime.UtcNow;
                 runtime.LiveNotPlayingAlertSent = false;
                 runtime.PlaybackConfirmedSinceUtc = null;
+                runtime.PlaybackProblemSinceUtc = null;
                 runtime.SafetyTargetReached = false;
 
                 string reason =
@@ -2333,6 +2877,48 @@ internal sealed class TwitchWatcher : IDisposable
             PublishStatus(runtime, "OFFLINE");
         }
     }
+
+    public async Task ApplyRemoteLiveSnapshotAsync(IReadOnlyList<BotRemoteLiveChannel> liveChannels)
+    {
+        if (liveChannels is null || liveChannels.Count == 0)
+            return;
+
+        foreach (BotRemoteLiveChannel remote in liveChannels)
+        {
+            string channel = ChannelTools.Normalize(remote.Channel);
+            if (channel.Length == 0)
+                continue;
+
+            if (!_channels.TryGetValue(channel, out ChannelRuntime? runtime))
+                continue; // Hosted bot may watch more channels than this PC.
+
+            bool streamChanged =
+                !string.IsNullOrWhiteSpace(remote.StreamId) &&
+                !string.Equals(runtime.LastStreamId, remote.StreamId, StringComparison.Ordinal);
+
+            runtime.LastKnownLive = true;
+            runtime.LastStreamId = remote.StreamId ?? runtime.LastStreamId;
+            runtime.LastSeenUtc = DateTime.UtcNow;
+            runtime.FreshStatusObservedUtc = DateTime.UtcNow;
+            runtime.LiveObservedSinceUtc ??= DateTime.UtcNow;
+            runtime.LiveDetectedUtc ??= DateTime.UtcNow;
+            runtime.DetectionConfidence = "24/7 bot";
+
+            bool alreadyOpened =
+                !string.IsNullOrWhiteSpace(remote.StreamId) &&
+                string.Equals(runtime.LastOpenedStreamId, remote.StreamId, StringComparison.Ordinal);
+
+            if ((_settings.OpenAlreadyLiveOnStartup || streamChanged) && !alreadyOpened)
+            {
+                Logger.Log($"{channel} | REMOTE BOT LIVE SNAPSHOT | stream={remote.StreamId ?? "unknown"} | opening=true");
+                await OnNewLiveAsync(runtime, remote.StreamId);
+            }
+        }
+
+        SaveState();
+        SaveBrowserBridge();
+    }
+
 
     private async Task OnNewLiveAsync(ChannelRuntime runtime, string? streamId)
     {
@@ -2511,20 +3097,31 @@ internal sealed class TwitchWatcher : IDisposable
 
     private void HandleNetworkSuccess()
     {
-        bool wasDown = _networkHealthy == false;
+        bool wasDown;
+        int generation = 0;
 
-        if (wasDown)
+        // Several channel checks complete concurrently. Without serializing this
+        // transition they can all observe "down" and emit duplicate RESTORED
+        // generations for the same physical reconnect.
+        lock (_networkStateLock)
         {
-            _networkRecoveryGeneration++;
-            Logger.Log(
-                $"NETWORK | RESTORED | generation={_networkRecoveryGeneration} | browser recovery queued");
-            NetworkChanged?.Invoke(true);
+            wasDown = _networkHealthy == false;
+            _networkHealthy = true;
+
+            if (wasDown)
+            {
+                _networkRecoveryGeneration++;
+                generation = _networkRecoveryGeneration;
+            }
         }
 
-        _networkHealthy = true;
+        if (!wasDown)
+            return;
 
-        if (wasDown)
-            SaveBrowserBridge();
+        Logger.Log(
+            $"NETWORK | RESTORED | generation={generation} | browser recovery queued");
+        NetworkChanged?.Invoke(true);
+        SaveBrowserBridge();
     }
 
     private async Task NetworkRecoveryTickAsync()
@@ -2541,14 +3138,25 @@ internal sealed class TwitchWatcher : IDisposable
             if (!await _client.ProbeTwitchAsync())
                 return;
 
-            _networkHealthy = true;
-            _networkRecoveryGeneration++;
+            int generation;
+            lock (_networkStateLock)
+            {
+                // Another successful channel check may have already completed
+                // the same reconnect while this probe was in flight.
+                if (_networkHealthy != false)
+                    return;
+
+                _networkHealthy = true;
+                _networkRecoveryGeneration++;
+                generation = _networkRecoveryGeneration;
+            }
+
             Logger.Log(
-                $"NETWORK | RESTORED | immediate full check | generation={_networkRecoveryGeneration} | browser recovery queued");
+                $"NETWORK | RESTORED | immediate full check | generation={generation} | browser recovery queued");
             NetworkChanged?.Invoke(true);
 
             // Tell Firefox immediately so tabs stuck on its "no internet" page
-            // can reload without waiting for all Twitch status checks to finish.
+            // can recover once, without duplicate generations.
             SaveBrowserBridge();
 
             foreach (var runtime in _channels.Values)
@@ -2659,6 +3267,7 @@ internal sealed class TwitchWatcher : IDisposable
                     continue;
 
                 BrowserChannelReport report = pair.Value;
+                string previousPlaybackStatus = runtime.PlaybackStatus;
                 runtime.PlaybackStatus =
                     string.IsNullOrWhiteSpace(report.Status) ? "Unknown" : report.Status;
 
@@ -2669,8 +3278,28 @@ internal sealed class TwitchWatcher : IDisposable
                     runtime.LastSuccessfulPlaybackUtc = report.LastSuccessfulPlaybackUtc;
                 }
 
-                if (runtime.LastKnownLive == true && runtime.PlaybackStatus.Equals("Playing", StringComparison.OrdinalIgnoreCase))
+                if (report.LastEventUtc is DateTime eventUtc &&
+                    (runtime.LastBrowserEventUtc is null ||
+                     eventUtc > runtime.LastBrowserEventUtc.Value))
                 {
+                    runtime.LastBrowserEventUtc = eventUtc;
+                    string eventType = string.IsNullOrWhiteSpace(report.LastEventType)
+                        ? "BROWSER-EVENT"
+                        : report.LastEventType!;
+                    string detail = report.LastEventDetail ?? "";
+                    Logger.Log($"{runtime.Channel} | {eventType} | {detail}");
+                    EventHistory.Add(eventType, runtime.Channel, detail);
+                }
+
+                // A channel is healthy only when Bridge 0.3.1 observed the
+                // actual Twitch video clock advancing.
+                bool playing =
+                    runtime.PlaybackStatus.Equals("Playing", StringComparison.OrdinalIgnoreCase) &&
+                    report.Progressing != false;
+                if (runtime.LastKnownLive == true && playing)
+                {
+                    runtime.PlaybackProblemSinceUtc = null;
+                    runtime.LiveNotPlayingAlertSent = false;
                     runtime.PlaybackConfirmedSinceUtc ??= DateTime.UtcNow;
                     int target = Math.Clamp(_settings.PlaybackSafetyTargetSeconds, 30, 1800);
                     int elapsed = (int)(DateTime.UtcNow - runtime.PlaybackConfirmedSinceUtc.Value).TotalSeconds;
@@ -2684,6 +3313,8 @@ internal sealed class TwitchWatcher : IDisposable
                 else if (runtime.LastKnownLive == true)
                 {
                     runtime.PlaybackConfirmedSinceUtc = null;
+                    if (runtime.PlaybackProblemSinceUtc is null || previousPlaybackStatus.Equals("Playing", StringComparison.OrdinalIgnoreCase))
+                        runtime.PlaybackProblemSinceUtc = DateTime.UtcNow;
                 }
 
                 PublishStatus(
@@ -2798,16 +3429,53 @@ internal sealed class TwitchWatcher : IDisposable
     {
         try
         {
-            var candidateLive=_channels.Values.Where(x=>x.LastKnownLive==true && x.FreshStatusObservedUtc is not null).Where(x=>ChannelPreferenceTools.Get(_settings,x.Channel).AutoOpen).ToList();
-            int burst=Math.Clamp(_settings.SafeModeBurstThreshold,2,20);
-            bool suspicious=_settings.SafeMode && candidateLive.Count(x=>x.LiveDetectedUtc is not null && (DateTime.UtcNow-x.LiveDetectedUtc.Value).TotalSeconds<=30)>=burst;
-            var safeLive=suspicious ? new List<ChannelRuntime>() : candidateLive;
-            if(suspicious) { Logger.Log($"SAFE MODE | BLOCKED MASS LIVE OPEN | count={candidateLive.Count}"); EventHistory.Add("SAFE-MODE","",$"Blocked suspicious LIVE burst ({candidateLive.Count})"); }
+            var candidateLive = _channels.Values
+                .Where(x => x.LastKnownLive == true && x.FreshStatusObservedUtc is not null)
+                .Where(x => ChannelPreferenceTools.Get(_settings, x.Channel).AutoOpen)
+                .ToList();
+
+            int burst = Math.Clamp(_settings.SafeModeBurstThreshold, 2, 20);
+
+            static bool IsTrustedLive(ChannelRuntime runtime) =>
+                runtime.DetectionConfidence.Equals("Primary API", StringComparison.OrdinalIgnoreCase) ||
+                runtime.DetectionConfidence.Equals("HLS fallback", StringComparison.OrdinalIgnoreCase);
+
+            var trustedLive = candidateLive.Where(IsTrustedLive).ToList();
+            var untrustedLive = candidateLive.Where(x => !IsTrustedLive(x)).ToList();
+
+            int recentUntrusted = untrustedLive.Count(x =>
+                x.LiveDetectedUtc is not null &&
+                (DateTime.UtcNow - x.LiveDetectedUtc.Value).TotalSeconds <= 30);
+
+            bool suspicious = _settings.SafeMode && recentUntrusted >= burst;
+
+            // Safe Mode now protects against suspicious/unknown bursts only.
+            // Twitch-confirmed Primary/HLS LIVE channels are never blocked
+            // merely because 5+ channels are live at startup.
+            var safeLive = suspicious ? trustedLive : candidateLive;
+
+            if (suspicious)
+            {
+                Logger.Log(
+                    $"SAFE MODE | BLOCKED UNTRUSTED LIVE BURST | untrusted={untrustedLive.Count} | trusted-allowed={trustedLive.Count}");
+                EventHistory.Add(
+                    "SAFE-MODE",
+                    "",
+                    $"Blocked suspicious untrusted LIVE burst ({untrustedLive.Count}); allowed {trustedLive.Count} trusted LIVE channel(s)");
+            }
             var bridge = new BrowserBridgeState
             {
                 UpdatedUtc = DateTime.UtcNow,
                 ReopenClosedLiveTabs = true,
                 KeepManagedTabsMuted = true,
+                ForceLowestQuality = _settings.ForceLowestStreamQuality,
+                LowDataMode = _settings.LowDataMode,
+                MaxSimultaneousStreams = Math.Clamp(_settings.MaxSimultaneousStreams, 1, 4),
+                CloseAfterLowDataTarget = _settings.CloseAfterLowDataTarget,
+                LowDataTargetSeconds = Math.Clamp(_settings.LowDataTargetSeconds, 300, 3600),
+                MonitorOnly = _settings.MonitorOnly,
+                NetworkHealthy = _networkHealthy != false,
+                SessionId = _bridgeSessionId,
                 NetworkRecoveryGeneration = _networkRecoveryGeneration,
                 PlaybackStartupTimeoutSeconds = Math.Clamp(_settings.PlaybackStartupTimeoutSeconds, 10, 120),
                 LiveChannels = safeLive
@@ -2815,8 +3483,15 @@ internal sealed class TwitchWatcher : IDisposable
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .OrderBy(c => c)
                     .ToList(),
-                LiveStreamIds = safeLive.Where(c => !string.IsNullOrWhiteSpace(c.LastStreamId))
-                    .ToDictionary(c => c.Channel, c => c.LastStreamId!, StringComparer.OrdinalIgnoreCase),
+                // Stream IDs let Low Data Mode remember that a specific live
+                // broadcast already completed its bounded watch session. A new
+                // Twitch stream ID automatically makes the channel eligible again.
+                LiveStreamIds = safeLive
+                    .Where(c => !string.IsNullOrWhiteSpace(c.LastStreamId))
+                    .ToDictionary(
+                        c => c.Channel,
+                        c => c.LastStreamId!,
+                        StringComparer.OrdinalIgnoreCase),
                 CloseWhenOffline = _channels.Values
                     .ToDictionary(
                         c => c.Channel,
@@ -2835,12 +3510,33 @@ internal sealed class TwitchWatcher : IDisposable
                         StringComparer.OrdinalIgnoreCase)
             };
 
-            string tmp = AppPaths.BrowserBridgePath + ".tmp";
-            File.WriteAllText(
-                tmp,
-                JsonSerializer.Serialize(bridge, JsonOptions.Default));
-            File.Copy(tmp, AppPaths.BrowserBridgePath, true);
-            File.Delete(tmp);
+            // Publish state with a unique temp file + atomic same-volume rename.
+            // The Native Messaging host reads this file every ~2s; File.Copy over
+            // the destination could race that reader and leave stale LIVE state.
+            string payload = JsonSerializer.Serialize(bridge, JsonOptions.Default);
+            string tmp = AppPaths.BrowserBridgePath + $".{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
+            File.WriteAllText(tmp, payload);
+
+            Exception? lastPublishError = null;
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                try
+                {
+                    File.Move(tmp, AppPaths.BrowserBridgePath, true);
+                    lastPublishError = null;
+                    break;
+                }
+                catch (IOException ex)
+                {
+                    lastPublishError = ex;
+                    Thread.Sleep(20 * (attempt + 1));
+                }
+            }
+
+            if (lastPublishError is not null)
+                throw lastPublishError;
+
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
         }
         catch (Exception ex)
         {
@@ -2920,11 +3616,21 @@ internal sealed class TwitchWatcher : IDisposable
         return true;
     }
 
-    public bool ShouldAlertLiveNotPlaying(string channel,int seconds)
+    public bool ShouldAlertLiveNotPlaying(string channel, int seconds)
     {
-        string key=ChannelTools.Normalize(channel); if(!_channels.TryGetValue(key,out ChannelRuntime? r)) return false;
-        if(r.LastKnownLive!=true || r.LiveDetectedUtc is null || r.LiveNotPlayingAlertSent || r.PlaybackStatus.Equals("Playing",StringComparison.OrdinalIgnoreCase)) return false;
-        if((DateTime.UtcNow-r.LiveDetectedUtc.Value).TotalSeconds<seconds) return false; r.LiveNotPlayingAlertSent=true; return true;
+        string key = ChannelTools.Normalize(channel);
+        if (!_channels.TryGetValue(key, out ChannelRuntime? r)) return false;
+        if (r.LastKnownLive != true ||
+            r.LiveNotPlayingAlertSent ||
+            r.PlaybackStatus.Equals("Playing", StringComparison.OrdinalIgnoreCase) ||
+            r.PlaybackStatus.StartsWith("Recovering", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        DateTime? problemSince = r.PlaybackProblemSinceUtc ?? r.LiveDetectedUtc;
+        if (problemSince is null) return false;
+        if ((DateTime.UtcNow - problemSince.Value).TotalSeconds < seconds) return false;
+        r.LiveNotPlayingAlertSent = true;
+        return true;
     }
 
     public void Dispose()
@@ -2972,6 +3678,14 @@ internal sealed class BrowserBridgeState
     public DateTime UpdatedUtc { get; set; }
     public bool ReopenClosedLiveTabs { get; set; } = true;
     public bool KeepManagedTabsMuted { get; set; } = true;
+    public bool ForceLowestQuality { get; set; } = true;
+    public bool LowDataMode { get; set; } = true;
+    public int MaxSimultaneousStreams { get; set; } = 1;
+    public bool CloseAfterLowDataTarget { get; set; } = true;
+    public int LowDataTargetSeconds { get; set; } = 600;
+    public bool MonitorOnly { get; set; } = false;
+    public bool NetworkHealthy { get; set; } = true;
+    public string SessionId { get; set; } = "";
     public int NetworkRecoveryGeneration { get; set; }
     public int PlaybackStartupTimeoutSeconds { get; set; } = 20;
     public List<string> LiveChannels { get; set; } = [];
@@ -2998,6 +3712,20 @@ internal sealed class BrowserChannelReport
     public DateTime? LastSuccessfulPlaybackUtc { get; set; }
     public int FailureCount { get; set; }
     public int? TabId { get; set; }
+
+    // Browser Bridge 0.3.1 real-player telemetry.
+    public bool? HasVideo { get; set; }
+    public bool? Paused { get; set; }
+    public int? ReadyState { get; set; }
+    public double? CurrentTime { get; set; }
+    public bool? Progressing { get; set; }
+    public DateTime? LastProgressUtc { get; set; }
+    public string? RecoveryAction { get; set; }
+
+    // Persistent browser event cursor. The desktop logs each event once.
+    public string? LastEventType { get; set; }
+    public DateTime? LastEventUtc { get; set; }
+    public string? LastEventDetail { get; set; }
 }
 
 internal sealed class NativeRequest
@@ -3796,8 +4524,13 @@ internal sealed class TwitchStatusClient : IDisposable
 
             if (!hlsResponse.IsSuccessStatusCode)
             {
-                Logger.Log(
-                    $"{channel} | LIVE FALLBACK | HLS not live | HTTP {(int)hlsResponse.StatusCode}");
+                // A 404 from Usher is the normal "not live" outcome and was
+                // flooding logs every check for every offline channel.
+                if ((int)hlsResponse.StatusCode != 404)
+                {
+                    Logger.Log(
+                        $"{channel} | LIVE FALLBACK | HLS HTTP {(int)hlsResponse.StatusCode}");
+                }
                 return false;
             }
 
@@ -4246,6 +4979,304 @@ internal sealed class DiscordNotifier : IDisposable
     }
 }
 
+internal sealed class BotAgentClient : IDisposable
+{
+    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(12) };
+    private Settings _settings;
+    private readonly Func<BotAgentHeartbeat> _heartbeatProvider;
+    private readonly Func<IReadOnlyList<BotRemoteLiveChannel>, Task> _snapshotHandler;
+    private readonly System.Threading.Timer _timer;
+    private int _busy;
+    private bool _disposed;
+
+    public BotAgentClient(
+        Settings settings,
+        Func<BotAgentHeartbeat> heartbeatProvider,
+        Func<IReadOnlyList<BotRemoteLiveChannel>, Task> snapshotHandler)
+    {
+        _settings = Clone(settings);
+        _heartbeatProvider = heartbeatProvider;
+        _snapshotHandler = snapshotHandler;
+        _timer = new System.Threading.Timer(
+            async _ => await TickAsync(),
+            null,
+            TimeSpan.FromSeconds(8),
+            TimeSpan.FromSeconds(Math.Clamp(_settings.BotHeartbeatSeconds, 30, 300)));
+    }
+
+    public void ApplySettings(Settings settings)
+    {
+        _settings = Clone(settings);
+        _timer.Change(
+            TimeSpan.FromSeconds(3),
+            TimeSpan.FromSeconds(Math.Clamp(_settings.BotHeartbeatSeconds, 30, 300)));
+    }
+
+    public async Task<BotPairResult> PairAsync(string code, string deviceName)
+    {
+        try
+        {
+            string baseUrl = (_settings.BotApiBaseUrl ?? "").Trim().TrimEnd('/');
+            if (string.IsNullOrWhiteSpace(baseUrl))
+                return new BotPairResult { Error = "api_url_required" };
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/agent/pair");
+            req.Content = new StringContent(
+                JsonSerializer.Serialize(new
+                {
+                    code = (code ?? "").Trim().ToUpperInvariant(),
+                    deviceName = string.IsNullOrWhiteSpace(deviceName) ? Environment.MachineName : deviceName.Trim()
+                }, JsonOptions.Default),
+                Encoding.UTF8,
+                "application/json");
+
+            using HttpResponseMessage res = await _http.SendAsync(req);
+            string json = await res.Content.ReadAsStringAsync();
+            BotPairResponse? response = null;
+            try { response = JsonSerializer.Deserialize<BotPairResponse>(json, JsonOptions.Default); } catch { }
+            if (!res.IsSuccessStatusCode || response?.Ok != true || string.IsNullOrWhiteSpace(response.Token))
+            {
+                string error = response?.Error ?? $"http_{(int)res.StatusCode}";
+                Logger.Log($"BOT AGENT | PAIR FAILED | {error}");
+                return new BotPairResult { Error = error };
+            }
+
+            BotDeviceCredentialStore.Save(new BotDeviceCredential
+            {
+                Token = response.Token,
+                DeviceId = response.DeviceId ?? "",
+                GuildId = response.Guild?.Id ?? "",
+                GuildName = response.Guild?.Name ?? "Discord Server",
+                PairedUtc = DateTime.UtcNow
+            });
+            Logger.Log($"BOT AGENT | PAIRED | guild={response.Guild?.Name ?? response.Guild?.Id ?? "unknown"} | device={response.DeviceId}");
+            return new BotPairResult { Ok = true, GuildName = response.Guild?.Name, DeviceId = response.DeviceId };
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"BOT AGENT | PAIR FAILED | {ex.GetType().Name}: {ex.Message}");
+            return new BotPairResult { Error = ex.GetType().Name };
+        }
+    }
+
+    public async Task<bool> SendHeartbeatNowAsync()
+    {
+        if (!_settings.BotControlEnabled)
+            return false;
+        return await SendHeartbeatCoreAsync();
+    }
+
+    private async Task TickAsync()
+    {
+        if (_disposed || !_settings.BotControlEnabled)
+            return;
+        if (Interlocked.Exchange(ref _busy, 1) != 0)
+            return;
+        try { await SendHeartbeatCoreAsync(); }
+        finally { Interlocked.Exchange(ref _busy, 0); }
+    }
+
+    private async Task<bool> SendHeartbeatCoreAsync()
+    {
+        try
+        {
+            BotDeviceCredential? credential = BotDeviceCredentialStore.Load();
+            string baseUrl = (_settings.BotApiBaseUrl ?? "").Trim().TrimEnd('/');
+            if (credential is null || string.IsNullOrWhiteSpace(credential.Token) || string.IsNullOrWhiteSpace(baseUrl))
+                return false;
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/agent/heartbeat");
+            req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", credential.Token);
+            req.Content = new StringContent(
+                JsonSerializer.Serialize(_heartbeatProvider(), JsonOptions.Default),
+                Encoding.UTF8,
+                "application/json");
+
+            using HttpResponseMessage res = await _http.SendAsync(req);
+            if (!res.IsSuccessStatusCode)
+            {
+                Logger.Log($"BOT AGENT | HEARTBEAT FAILED | HTTP {(int)res.StatusCode}");
+                return false;
+            }
+
+            string json = await res.Content.ReadAsStringAsync();
+            BotAgentHeartbeatResponse? response =
+                JsonSerializer.Deserialize<BotAgentHeartbeatResponse>(json, JsonOptions.Default);
+            if (response?.Live is { Count: > 0 })
+                await _snapshotHandler(response.Live);
+
+            Logger.Log($"BOT AGENT | HEARTBEAT OK | live={response?.Live?.Count ?? 0}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"BOT AGENT | HEARTBEAT FAILED | {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
+    public async Task SendEventAsync(string eventName, string channel, string detail)
+    {
+        if (_disposed || !_settings.BotControlEnabled)
+            return;
+
+        try
+        {
+            BotDeviceCredential? credential = BotDeviceCredentialStore.Load();
+            string baseUrl = (_settings.BotApiBaseUrl ?? "").Trim().TrimEnd('/');
+            if (credential is null || string.IsNullOrWhiteSpace(credential.Token) || string.IsNullOrWhiteSpace(baseUrl))
+                return;
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/agent/event");
+            req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", credential.Token);
+            req.Content = new StringContent(
+                JsonSerializer.Serialize(new
+                {
+                    @event = eventName,
+                    channel,
+                    detail
+                }, JsonOptions.Default),
+                Encoding.UTF8,
+                "application/json");
+            using HttpResponseMessage res = await _http.SendAsync(req);
+            if (!res.IsSuccessStatusCode)
+                Logger.Log($"BOT AGENT | EVENT {eventName} FAILED | HTTP {(int)res.StatusCode}");
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"BOT AGENT | EVENT {eventName} FAILED | {ex.GetType().Name}");
+        }
+    }
+
+    public async Task<bool> UnpairAsync()
+    {
+        try
+        {
+            BotDeviceCredential? credential = BotDeviceCredentialStore.Load();
+            string baseUrl = (_settings.BotApiBaseUrl ?? "").Trim().TrimEnd('/');
+            if (credential is null || string.IsNullOrWhiteSpace(credential.Token) || string.IsNullOrWhiteSpace(baseUrl))
+                return false;
+            using var req = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/agent/unpair");
+            req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", credential.Token);
+            using HttpResponseMessage res = await _http.SendAsync(req);
+            Logger.Log($"BOT AGENT | UNPAIR | HTTP {(int)res.StatusCode}");
+            return res.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"BOT AGENT | UNPAIR FAILED | {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static Settings Clone(Settings s) =>
+        JsonSerializer.Deserialize<Settings>(
+            JsonSerializer.Serialize(s, JsonOptions.Default),
+            JsonOptions.Default) ?? new Settings();
+
+    public void Dispose()
+    {
+        _disposed = true;
+        _timer.Dispose();
+        _http.Dispose();
+    }
+}
+
+internal static class BotDeviceCredentialStore
+{
+    public static BotDeviceCredential? Load()
+    {
+        try
+        {
+            if (!File.Exists(AppPaths.BotDeviceCredentialPath))
+                return null;
+            BotDeviceCredential? value = JsonSerializer.Deserialize<BotDeviceCredential>(
+                File.ReadAllText(AppPaths.BotDeviceCredentialPath), JsonOptions.Default);
+            return value is not null && !string.IsNullOrWhiteSpace(value.Token) ? value : null;
+        }
+        catch { return null; }
+    }
+
+    public static void Save(BotDeviceCredential credential)
+    {
+        try
+        {
+            AppPaths.EnsureDirectories();
+            string tmp = AppPaths.BotDeviceCredentialPath + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(credential, JsonOptions.Default));
+            File.Copy(tmp, AppPaths.BotDeviceCredentialPath, true);
+            File.Delete(tmp);
+        }
+        catch { }
+    }
+
+    public static void Clear()
+    {
+        try
+        {
+            if (File.Exists(AppPaths.BotDeviceCredentialPath))
+                File.Delete(AppPaths.BotDeviceCredentialPath);
+        }
+        catch { }
+    }
+}
+
+internal sealed class BotDeviceCredential
+{
+    public string Token { get; set; } = "";
+    public string DeviceId { get; set; } = "";
+    public string GuildId { get; set; } = "";
+    public string GuildName { get; set; } = "Discord Server";
+    public DateTime PairedUtc { get; set; }
+}
+
+internal sealed class BotPairResult
+{
+    public bool Ok { get; set; }
+    public string? Error { get; set; }
+    public string? GuildName { get; set; }
+    public string? DeviceId { get; set; }
+}
+
+internal sealed class BotPairResponse
+{
+    public bool Ok { get; set; }
+    public string? Error { get; set; }
+    public int ApiVersion { get; set; }
+    public string? Token { get; set; }
+    public string? DeviceId { get; set; }
+    public BotPairGuild? Guild { get; set; }
+}
+
+internal sealed class BotPairGuild
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "Discord Server";
+}
+
+
+internal sealed class BotAgentHeartbeat
+{
+    public string Name { get; set; } = Environment.MachineName;
+    public string AppVersion { get; set; } = "10.1.3";
+    public string Bridge { get; set; } = "unknown";
+    public bool NetworkHealthy { get; set; }
+    public bool MonitoringPaused { get; set; }
+}
+
+internal sealed class BotAgentHeartbeatResponse
+{
+    public bool Ok { get; set; }
+    public List<BotRemoteLiveChannel> Live { get; set; } = new();
+}
+
+internal sealed class BotRemoteLiveChannel
+{
+    public string Channel { get; set; } = "";
+    public string? StreamId { get; set; }
+}
+
+
 internal sealed class Settings
 {
     public int CheckEverySeconds { get; set; } = 15;
@@ -4253,11 +5284,18 @@ internal sealed class Settings
     public string Browser { get; set; } = "firefox";
     public int BrowserCheckDelaySeconds { get; set; } = 4;
     public int BrowserRetrySeconds { get; set; } = 10;
-    public bool OpenAlreadyLiveOnStartup { get; set; } = false;
+    public bool OpenAlreadyLiveOnStartup { get; set; } = true;
     public int NetworkRetrySeconds { get; set; } = 5;
     public int HeartbeatMinutes { get; set; } = 30;
     public int MaxConcurrentChecks { get; set; } = 4;
     public bool StartWithWindows { get; set; } = false;
+    public bool KeepAwakeWhileMonitoring { get; set; } = true;
+    public bool ForceLowestStreamQuality { get; set; } = true;
+    public bool LowDataMode { get; set; } = true;
+    public int MaxSimultaneousStreams { get; set; } = 1;
+    public bool CloseAfterLowDataTarget { get; set; } = true;
+    public int LowDataTargetSeconds { get; set; } = 600;
+    public bool MonitorOnly { get; set; } = false;
     public int OfflineGraceSeconds { get; set; } = 45;
     public int PlaybackStartupTimeoutSeconds { get; set; } = 20;
     public bool DiscordEnabled { get; set; } = false;
@@ -4278,6 +5316,10 @@ internal sealed class Settings
     public int SmartLiveRecheckSeconds { get; set; } = 5;
     public int BridgeSelfHealSeconds { get; set; } = 15;
     public bool RemoteMonitorSnapshotEnabled { get; set; } = true;
+    public bool BotControlEnabled { get; set; } = false;
+    public string BotApiBaseUrl { get; set; } = "";
+    public string BotAgentName { get; set; } = Environment.MachineName;
+    public int BotHeartbeatSeconds { get; set; } = 60;
     public bool UpdateCheckEnabled { get; set; } = false;
     public string UpdateManifestUrl { get; set; } = "";
     public List<string> Channels { get; set; } = [];
@@ -4329,6 +5371,8 @@ internal sealed class ChannelRuntime
     public DateTime? LastPriorityCheckUtc { get; set; }
     public DateTime? LastSuccessfulPlaybackUtc { get; set; }
     public DateTime? PlaybackConfirmedSinceUtc { get; set; }
+    public DateTime? PlaybackProblemSinceUtc { get; set; }
+    public DateTime? LastBrowserEventUtc { get; set; }
     public bool SafetyTargetReached { get; set; }
     public int ConsecutiveFailures { get; set; }
     public DateTime? NextAllowedCheckUtc { get; set; }

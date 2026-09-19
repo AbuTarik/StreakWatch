@@ -1,12 +1,11 @@
 {
   "manifest_version": 2,
   "name": "StreakWatch Browser Bridge",
-  "version": "0.3.0",
-  "description": "Keeps StreakWatch-managed Twitch live tabs open, muted, and deduplicated.",
+  "version": "1.0.4",
+  "description": "Connects Firefox with the StreakWatch desktop app to manage StreakWatch-controlled Twitch tabs.",
   "permissions": [
     "tabs",
     "nativeMessaging",
-    "storage",
     "*://*.twitch.tv/*"
   ],
   "background": {
@@ -24,7 +23,12 @@
   },
   "browser_specific_settings": {
     "gecko": {
-      "id": "streakwatch-bridge@local"
+      "id": "streakwatch-bridge@local",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
     }
   },
   "icons": {

@@ -1,0 +1,110 @@
+StreakWatch Firefox Bridge - V9.0 TEST INSTALL
+
+IMPORTANT
+---------
+This is an unsigned development/test extension.
+Firefox Stable does not keep temporary add-ons installed after Firefox restarts.
+For permanent public distribution, the extension should be signed by Mozilla.
+
+STEP 1 - Publish StreakWatch V8.2
+---------------------------------
+Run:
+  publish-win-x64.bat
+
+STEP 2 - Register the native bridge
+-----------------------------------
+Copy the FirefoxExtension folder next to the published StreakWatch.exe,
+then run:
+  register-firefox-bridge.bat
+
+The script creates a Firefox Native Messaging host manifest in:
+  %AppData%\StreakWatch\NativeMessaging\
+
+and registers it for the current Windows user.
+
+STEP 3 - Load the extension temporarily in Firefox
+---------------------------------------------------
+1. Open:
+     about:debugging#/runtime/this-firefox
+2. Click:
+     Load Temporary Add-on...
+3. Select:
+     FirefoxExtension\manifest.json
+
+STEP 4 - Test
+-------------
+Keep StreakWatch V8.2 running.
+
+When a configured channel is LIVE:
+- StreakWatch still detects LIVE/OFFLINE.
+- The extension finds/opens the Twitch channel tab.
+- The tab is muted at Firefox tab level.
+- If you close that tab while the channel is still LIVE, the extension recreates it.
+- If the channel becomes OFFLINE, closing the tab will NOT make it reopen.
+
+NOTES
+-----
+- The extension only manages configured channels that StreakWatch currently reports LIVE.
+- It does not fake Twitch views, rewards, playback, or Watch Streak events.
+- A muted/open tab does not guarantee Twitch is actually playing or counting a Watch Streak.
+
+
+V8.2.1 IMPORTANT FIX
+--------------------
+After publishing V8.2.1 you MUST run register-firefox-bridge.bat again.
+V8.2 accidentally registered StreakWatch.exe directly, so Firefox launched it
+without the required --native-host argument. That caused the repeated
+"StreakWatch is already running" popup.
+
+V8.2.1 registers a small .cmd native-host wrapper which launches:
+  StreakWatch.exe --native-host
+
+Native bridge diagnostics are written to:
+  %AppData%\StreakWatch\native-bridge.log
+
+
+V8.2.2 IMPORTANT
+----------------
+Remove the old temporary add-on before loading this version.
+The duplicate-tab bug was a race between multiple reconcile callbacks.
+V8.2.2 serializes reconcile calls and blocks duplicate creation per channel.
+
+
+V8.2.3
+------
+Newly-created LIVE Twitch tabs are opened as ACTIVE tabs and kept selected
+briefly so Twitch can initialize playback. Remove the old temporary extension
+and load this version's manifest.json.
+
+
+V8.2.4
+------
+Adds automatic Twitch player Error #2000 recovery. Remove the old temporary extension and load this version's manifest.json.
+
+
+V8.2.6
+------
+Adds actual playback checking/start attempts for managed Twitch video elements.
+Remove the previous temporary extension and load this version's manifest.json.
+
+
+V8.2.7
+------
+Adds automatic closing of StreakWatch-managed Twitch tabs when their channel
+is no longer LIVE. Remove the old temporary extension and load this version.
+
+
+V9.0
+----
+- Reports real playback state back to the desktop app.
+- Per-channel close-offline policy.
+- Stronger startup/paused/stalled recovery.
+- Error #2000 recovery retained.
+
+V9.0.6: adds per-channel Mute policy.
+
+V9.0.6: Mute is Firefox-tab-only; removed HTML5 video mute and aggressive focus/reload recovery.
+
+V9.0.6: fixes multiple LIVE channels opening together; creates all tabs first, then initializes each once.
+
+V9.0.6: reloads managed LIVE tabs once when internet connectivity returns, without stealing focus.

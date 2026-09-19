@@ -1,0 +1,13 @@
+StreakWatch V10.1.3 / Bridge 1.0.4
+
+Root cause fixed:
+- Low Data Mode calculated orderedWanted correctly, but tab creation mistakenly iterated recoveryLive + normalLive (all LIVE channels).
+- With MaxSimultaneousStreams=1 this opened an unselected second channel; the next reconcile closed it; the following reconcile opened it again.
+- Creation now iterates ONLY orderedWanted, so channels waiting for a Low Data slot remain closed until admitted.
+
+Additional hardening:
+- One activation/prime operation per channel at a time.
+- 90-second activation cooldown after a failed 25-second playback verification, preventing repeated PLAYBACK-START-TIMEOUT storms.
+- Activation state is cleared on session reset / Low Data completion.
+- Manual Twitch tabs remain untouched.
+- Mute remains Firefox tab-level only; video.muted/video.volume are not assigned.
